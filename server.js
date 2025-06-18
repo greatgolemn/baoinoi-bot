@@ -1,8 +1,7 @@
 // server.js
 
 require('dotenv').config();
-const express    = require('express');
-const bodyParser = require('body-parser');
+const express    = require('express');\const bodyParser = require('body-parser');
 const { Firestore, FieldValue } = require('@google-cloud/firestore');
 const { OpenAI } = require('openai');
 const axios      = require('axios');
@@ -10,9 +9,37 @@ const axios      = require('axios');
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
 const assistantPrompt   = process.env.ASSISTANT_PROMPT; // ใส่ prompt เดิมของคุณใน .env
-const db                = new Firestore();
-const openai            = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// Load Firestore credentials from ENV (JSON as string or Base64)
+const serviceAccount = process.env.SERVICE_ACCOUNT_KEY;
+if (!serviceAccount) {
+  console.error('❌ Missing SERVICE_ACCOUNT_KEY environment variable');
+  process.exit(1);
+}
+let credentials;
+try {
+  // if stored as Base64, decode first
+  const raw = /^[A-Za-z0-9+/=]+$/.test(serviceAccount.trim())
+    ? Buffer.from(serviceAccount, 'base64').toString('utf8')
+    : serviceAccount;
+  credentials = JSON.parse(raw);
+} catch (err) {
+  console.error('❌ Invalid SERVICE_ACCOUNT_KEY JSON:', err);
+  process.exit(1);
+}
+// Initialize Firestore with explicit credentials
+const db = new Firestore({
+  projectId: credentials.project_id,
+  credentials: {
+    client_email: credentials.client_email,
+    private_key: credentials.private_key.replace(/\\n/g, '\n')
+  }
+});
+
+// Initialize OpenAI
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Define function for orders
 const functions = [
   {
     name: "submit_order",
@@ -46,55 +73,64 @@ app.get('/webhook', (req, res) => {
   res.sendStatus(403);
 });
 
-// 2) Webhook event handler
+// 2) Message handler with session/thread management
 app.post('/webhook', async (req, res) => {
   try {
-    const messaging = req.body.entry?.[0]?.messaging?.[0];
-    if (!messaging || !messaging.message?.text) return res.sendStatus(200);
+    const msg = req.body.entry?.[0]?.messaging?.[0];
+    if (!msg || !msg.message?.text) return res.sendStatus(200);
 
-    const psid = messaging.sender.id;
-    const text = messaging.message.text;
+    const psid = msg.sender.id;
+    const text = msg.message.text;
 
-    // build messages array reusing your existing prompt
-    const messages = [
-      { role: "system", content: assistantPrompt },
-      { role: "user",   content: text }
-    ];
+    // Session doc for this PSID
+    const sessionRef = db.collection('sessions').doc(psid);
+    const sessionSnap = await sessionRef.get();
+    let threadId = sessionSnap.exists ? sessionSnap.data().threadId : null;
 
-    // 3) call OpenAI with function support
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages,
-      functions,
-      function_call: "auto"
+    // Create new thread if none
+    if (!threadId) {
+      const thread = await openai.beta.threads.create();
+      threadId = thread.id;
+      await sessionRef.set({ threadId });
+    }
+
+    // Append user message to thread
+    await openai.beta.threads.messages.create(threadId, {
+      role: 'user',
+      content: text
     });
 
-    const reply = completion.choices[0].message;
+    // Run assistant thread
+    const run = await openai.beta.threads.runs.create(threadId, {
+      assistant_id: process.env.ASSISTANT_ID
+    });
 
-    if (reply.function_call) {
-      // 4) parse and save order
-      const order = JSON.parse(reply.function_call.arguments);
-      await db.collection('orders').add({
-        ...order,
-        timestamp: FieldValue.serverTimestamp()
-      });
+    // Wait for completion
+    let status;
+    do {
+      status = await openai.beta.threads.runs.retrieve(threadId, run.id);
+      await new Promise(r => setTimeout(r, 1000));
+    } while (status.status !== 'completed');
 
-      // 5) confirm to user
+    // Fetch assistant messages
+    const messages = await openai.beta.threads.messages.list(threadId);
+    const lastMsg = messages.data.slice(-1)[0];
+    const replyMsg = lastMsg.content[0].text.value;
+
+    // Handle function call if any
+    if (lastMsg.function_call) {
+      const order = JSON.parse(lastMsg.function_call.arguments);
+      await db.collection('orders').add({ ...order, timestamp: FieldValue.serverTimestamp() });
+      // Confirm to user
       await axios.post(
         `https://graph.facebook.com/v15.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-        {
-          recipient: { id: psid },
-          message:   { text: "ขอบคุณครับ พี่สั่งเรียบร้อยแล้วนะครับ 😊" }
-        }
+        { recipient: { id: psid }, message: { text: "ขอบคุณครับ พี่สั่งเรียบร้อยแล้วนะครับ 😊" } }
       );
     } else {
-      // 6) Q&A fallback
+      // Normal reply
       await axios.post(
         `https://graph.facebook.com/v15.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-        {
-          recipient: { id: psid },
-          message:   { text: reply.content }
-        }
+        { recipient: { id: psid }, message: { text: replyMsg } }
       );
     }
 
@@ -105,6 +141,6 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// 7) start server
+// 3) Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server is running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
