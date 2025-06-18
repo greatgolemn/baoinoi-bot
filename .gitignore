@@ -1,0 +1,2 @@
+echo "serviceAccount.json" >> .gitignore
+echo ".env"               >> .gitignore
