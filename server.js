@@ -1,7 +1,8 @@
 // server.js
 
 require('dotenv').config();
-const express    = require('express');\const bodyParser = require('body-parser');
+const express    = require('express');
+const bodyParser = require('body-parser');
 const { Firestore, FieldValue } = require('@google-cloud/firestore');
 const { OpenAI } = require('openai');
 const axios      = require('axios');
