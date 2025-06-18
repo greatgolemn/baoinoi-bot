@@ -28,6 +28,7 @@ try {
   console.error('❌ Invalid SERVICE_ACCOUNT_KEY JSON:', err);
   process.exit(1);
 }
+
 // Initialize Firestore with explicit credentials
 const db = new Firestore({
   projectId: credentials.project_id,
@@ -68,7 +69,10 @@ const app = express().use(bodyParser.json());
 
 // 1) Webhook verification
 app.get('/webhook', (req, res) => {
-  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN) {
+  if (
+    req.query['hub.mode'] === 'subscribe' &&
+    req.query['hub.verify_token'] === VERIFY_TOKEN
+  ) {
     return res.status(200).send(req.query['hub.challenge']);
   }
   res.sendStatus(403);
